@@ -6,8 +6,8 @@ import html
 import logging
 import re
 
-BOT_TOKEN = "8110676305:AAFvh5EDC8a3CwIaQooNSAy0WNxsQe2KVC0"
-CHAT_ID   = "-1004472784843"
+BOT_TOKEN = ""
+CHAT_ID   = ""
 
 BOARD     = "b"
 INTERVAL  = 60
