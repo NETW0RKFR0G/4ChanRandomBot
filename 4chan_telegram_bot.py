@@ -1,194 +1,179 @@
-"""
-4chan /b/ → Telegram Bot
-========================
-Surveille les nouveaux threads sur /b/ et les envoie dans ton channel Telegram.
-
-SETUP :
-1. Crée un bot Telegram via @BotFather → copie le token
-2. Ajoute le bot à ton channel et récupère le CHAT_ID
-   (envoie un msg dans ton channel, puis visite :
-    https://api.telegram.org/bot<TOKEN>/getUpdates)
-3. Remplis les variables BOT_TOKEN et CHAT_ID ci-dessous
-4. Installe les dépendances : pip install requests
-5. Lance : python 4chan_telegram_bot.py
-
-DÉPENDANCES : requests (stdlib uniquement sinon)
-"""
-
 import requests
 import time
 import json
 import os
 import html
 import logging
+import re
 
-# ─────────────────────────────────────────────
-#  ⚙️  CONFIGURATION  — À remplir !
-# ─────────────────────────────────────────────
-BOT_TOKEN = "VOTRE_BOT_TOKEN_ICI"          # ex: 123456:ABCdef...
-CHAT_ID   = "VOTRE_CHAT_ID_ICI"            # ex: -1001234567890 ou @moncanal
+BOT_TOKEN = "8110676305:AAFvh5EDC8a3CwIaQooNSAy0WNxsQe2KVC0"
+CHAT_ID   = "-1004472784843"
 
-BOARD     = "b"                             # board 4chan
-INTERVAL  = 60                              # secondes entre chaque vérification
-STATE_FILE = "seen_threads.json"            # fichier pour mémoriser les threads déjà vus
-MAX_MESSAGE_LENGTH = 4000                   # limite Telegram (4096 chars)
-# ─────────────────────────────────────────────
+BOARD     = "b"
+INTERVAL  = 60
+STATE_FILE = "seen_threads.json"
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
 
-FOURCHAN_API  = f"https://a.4cdn.org/{BOARD}/threads.json"
-FOURCHAN_BASE = f"https://boards.4chan.org/{BOARD}/thread/"
-TELEGRAM_API  = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-TELEGRAM_PHOTO = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
-FOURCHAN_IMG  = "https://i.4cdn.org/{board}/{tim}{ext}"
-
-
-# ── Persistance des threads déjà vus ──────────────────────────────────────────
-
-def load_seen() -> set:
+def load_seen():
     if os.path.exists(STATE_FILE):
         with open(STATE_FILE, "r") as f:
             return set(json.load(f))
     return set()
 
-
-def save_seen(seen: set):
+def save_seen(seen):
     with open(STATE_FILE, "w") as f:
         json.dump(list(seen), f)
 
-
-# ── Appels 4chan API ───────────────────────────────────────────────────────────
-
-def fetch_catalog() -> list[dict]:
-    """Retourne la liste des threads du catalog /b/."""
+def fetch_all_threads():
     try:
-        r = requests.get(FOURCHAN_API, timeout=15, headers={"User-Agent": "4chan-tg-bot/1.0"})
+        r = requests.get(f"https://a.4cdn.org/{BOARD}/threads.json", timeout=15, headers={"User-Agent": "bot/1.0"})
         r.raise_for_status()
-        pages = r.json()
         threads = []
-        for page in pages:
-            threads.extend(page.get("threads", []))
+        for page in r.json():
+            for t in page.get("threads", []):
+                threads.append(t)
         return threads
     except Exception as e:
-        log.error(f"Erreur catalog : {e}")
+        log.error(f"Erreur threads: {e}")
         return []
 
+def fetch_thread_details(no):
+    try:
+        r = requests.get(f"https://a.4cdn.org/{BOARD}/thread/{no}.json", timeout=15, headers={"User-Agent": "bot/1.0"})
+        r.raise_for_status()
+        posts = r.json().get("posts", [])
+        return posts[0] if posts else None
+    except Exception as e:
+        log.error(f"Erreur thread {no}: {e}")
+        return None
 
-# ── Formatage du message Telegram ─────────────────────────────────────────────
-
-def clean(text: str | None) -> str:
+def clean(text):
     if not text:
         return ""
-    return html.unescape(text).replace("<br>", "\n").replace("<wbr>", "")
+    text = html.unescape(text)
+    text = text.replace("<br>", "\n").replace("<wbr>", "")
+    text = re.sub(r"<[^>]+>", "", text)
+    return text.strip()
 
-
-def build_message(thread: dict) -> str:
-    no   = thread.get("no", "?")
-    sub  = clean(thread.get("sub", ""))
-    com  = clean(thread.get("com", ""))
-    url  = f"{FOURCHAN_BASE}{no}"
-
-    parts = [f"📌 <b>Nouveau thread #{no}</b>"]
-    if sub:
-        parts.append(f"<b>{sub[:200]}</b>")
-    if com:
-        excerpt = com[:800] + ("…" if len(com) > 800 else "")
-        parts.append(excerpt)
-    parts.append(f'\n🔗 <a href="{url}">/b/{no}</a>')
-
-    return "\n".join(parts)
-
-
-def get_image_url(thread: dict) -> str | None:
+def send_thread(thread, label=None):
+    no  = thread.get("no", "?")
+    sub = clean(thread.get("sub", ""))
+    com = clean(thread.get("com", ""))
+    url = f"https://boards.4chan.org/{BOARD}/thread/{no}"
     tim = thread.get("tim")
-    ext = thread.get("ext")
-    if tim and ext and ext.lower() in (".jpg", ".jpeg", ".png", ".gif", ".webp"):
-        return FOURCHAN_IMG.format(board=BOARD, tim=tim, ext=ext)
-    return None
+    ext = thread.get("ext", "")
 
+    title = sub if sub else (com[:80] + "..." if len(com) > 80 else com)
+    body  = com[80:880] if not sub else com[:800]
 
-# ── Envoi Telegram ─────────────────────────────────────────────────────────────
+    if label == "most_replied":
+        header = f"🏆 Most Replied #{no}"
+    elif label == "last_bump":
+        header = f"💬 Last Bump #{no}"
+    else:
+        header = f"📌 #{no}"
 
-def send_telegram(thread: dict):
-    text      = build_message(thread)
-    image_url = get_image_url(thread)
+    text = header
+    if title:
+        text += f"\n{title}"
+    if body:
+        text += f"\n{body}"
+    text += f"\n\n🔗 {url}"
+
+    image_url = None
+    if tim and ext.lower() in (".jpg", ".jpeg", ".png", ".gif", ".webp"):
+        image_url = f"https://i.4cdn.org/{BOARD}/{tim}{ext}"
 
     if image_url:
-        # Essaie d'envoyer avec image
-        payload = {
-            "chat_id":    CHAT_ID,
-            "photo":      image_url,
-            "caption":    text[:1024],       # caption limité à 1024
-            "parse_mode": "HTML",
-            "disable_web_page_preview": False,
-        }
-        r = requests.post(TELEGRAM_PHOTO, json=payload, timeout=15)
+        r = requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto", json={
+            "chat_id": CHAT_ID,
+            "photo": image_url,
+            "caption": text[:1024],
+        }, timeout=15)
         if r.ok:
             return
-        log.warning(f"Photo échouée ({r.status_code}), envoi texte seul…")
+        log.warning(f"Photo échouée, envoi texte...")
 
-    # Texte seul (ou fallback)
-    payload = {
-        "chat_id":                  CHAT_ID,
-        "text":                     text[:MAX_MESSAGE_LENGTH],
-        "parse_mode":               "HTML",
-        "disable_web_page_preview": True,
-    }
-    r = requests.post(TELEGRAM_API, json=payload, timeout=15)
+    r = requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage", json={
+        "chat_id": CHAT_ID,
+        "text": text[:4000],
+        "disable_web_page_preview": True
+    }, timeout=15)
     if not r.ok:
         log.error(f"Telegram error {r.status_code}: {r.text[:200]}")
 
+def post_most_replied():
+    log.info("📊 Recherche du thread Most Replied...")
+    threads = fetch_all_threads()
+    if not threads:
+        return
+    top = max(threads, key=lambda t: t.get("replies", 0))
+    details = fetch_thread_details(top["no"])
+    if details:
+        log.info(f"  → Most Replied: #{top['no']} ({top.get('replies')} replies)")
+        send_thread(details, label="most_replied")
 
-# ── Boucle principale ─────────────────────────────────────────────────────────
+def post_last_bump():
+    log.info("💬 Recherche du thread Last Bump...")
+    threads = fetch_all_threads()
+    if not threads:
+        return
+    latest = max(threads, key=lambda t: t.get("last_modified", 0))
+    details = fetch_thread_details(latest["no"])
+    if details:
+        log.info(f"  → Last Bump: #{latest['no']}")
+        send_thread(details, label="last_bump")
 
 def main():
     log.info(f"🤖 Bot démarré — surveillance de /b/ toutes les {INTERVAL}s")
-
-    if BOT_TOKEN == "VOTRE_BOT_TOKEN_ICI" or CHAT_ID == "VOTRE_CHAT_ID_ICI":
-        log.error("❌ Configure BOT_TOKEN et CHAT_ID avant de lancer le bot !")
-        return
-
     seen = load_seen()
-    log.info(f"📂 {len(seen)} threads déjà connus chargés.")
 
-    # Premier passage : on mémorise sans envoyer (évite le flood au démarrage)
     if not seen:
-        log.info("Premier démarrage : indexation des threads existants sans envoi…")
-        threads = fetch_catalog()
-        seen = {str(t["no"]) for t in threads}
+        log.info("Premier démarrage: indexation sans envoi...")
+        threads = fetch_all_threads()
+        seen = set(str(t["no"]) for t in threads)
         save_seen(seen)
-        log.info(f"✅ {len(seen)} threads indexés. Le bot enverra uniquement les nouveaux.")
+        log.info(f"✅ {len(seen)} threads indexés.")
+
+    last_most_replied = 0
+    last_last_bump    = 0
 
     while True:
         try:
-            threads = fetch_catalog()
+            now = time.time()
+
+            threads = fetch_all_threads()
             new_threads = [t for t in threads if str(t["no"]) not in seen]
 
             if new_threads:
-                log.info(f"🆕 {len(new_threads)} nouveau(x) thread(s) trouvé(s)")
-                for thread in new_threads:
-                    tid = str(thread["no"])
-                    log.info(f"  → Envoi thread #{tid}")
-                    send_telegram(thread)
-                    seen.add(tid)
-                    time.sleep(1)   # anti-flood Telegram (30 msg/s max)
+                log.info(f"🆕 {len(new_threads)} nouveau(x) thread(s)")
+                for t in new_threads:
+                    details = fetch_thread_details(t["no"])
+                    if details:
+                        log.info(f"  → Envoi thread #{t['no']}")
+                        send_thread(details)
+                    seen.add(str(t["no"]))
+                    time.sleep(1)
                 save_seen(seen)
             else:
                 log.info("Aucun nouveau thread.")
 
+            if now - last_most_replied >= 1800:
+                post_most_replied()
+                last_most_replied = now
+
+            if now - last_last_bump >= 900:
+                post_last_bump()
+                last_last_bump = now
+
         except KeyboardInterrupt:
-            log.info("Arrêt demandé.")
             break
         except Exception as e:
-            log.error(f"Erreur inattendue : {e}")
+            log.error(f"Erreur: {e}")
 
         time.sleep(INTERVAL)
-
 
 if __name__ == "__main__":
     main()
